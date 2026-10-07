@@ -27,13 +27,15 @@ const (
 
 // Environment 表示一个预览环境实例。
 type Environment struct {
-	Name       string    // 环境唯一标识（命名隔离的键）
-	Port       int       // 分配到的本地端口
-	State      State     // 当前状态
-	Holders    []string  // 当前占用者标识列表
-	CreatedAt  time.Time // 创建时间
-	ExpiresAt  time.Time // 过期时间，过期后可被回收
-	ReclaimErr string    // 最近一次回收失败原因（用于解释与重试）
+	Name       string               // 环境唯一标识（命名隔离的键）
+	Port       int                  // 分配到的本地端口
+	State      State                // 当前状态
+	Holders    []string             // 当前占用者标识列表
+	CreatedAt  time.Time            // 创建时间
+	ExpiresAt  time.Time            // 环境初始有效期（创建时间 + TTL），续期不改变该值
+	Leases     map[string]time.Time // 各占用者自己的租约到期时间（续期只影响对应键）
+	ReleasedAt time.Time            // 最后一个占用者离开的时间；有人占用时为零值
+	ReclaimErr string               // 最近一次回收失败原因（用于解释与重试）
 
 	handle *Handle // 后端实例句柄（未导出，由控制器管理）
 }
@@ -63,8 +65,10 @@ const (
 	ErrQuotaExceeded ErrCode = "QUOTA_EXCEEDED" // 配额耗尽
 	ErrEnvInUse      ErrCode = "ENV_IN_USE"     // 环境正在使用中，禁止释放/销毁
 	ErrNotFound      ErrCode = "NOT_FOUND"      // 环境不存在
-	ErrNotHeld       ErrCode = "NOT_HELD"       // 释放者并未占用该环境
+	ErrNotHeld       ErrCode = "NOT_HELD"       // 调用方并未占用该环境
 	ErrBackend       ErrCode = "BACKEND_ERROR"  // 后端（进程）操作失败，可重试
+	ErrLeaseExpired  ErrCode = "LEASE_EXPIRED"  // 已错过续期时间点（租约已到期，不能再续期）
+	ErrShuttingDown  ErrCode = "SHUTTING_DOWN"  // 服务正在停机收尾，不再接受新申请
 )
 
 // Error 是带原因码的错误，调用方可区分失败原因。
@@ -85,3 +89,37 @@ type AcquireResult struct {
 	Created   bool   // true 表示本次新建；false 表示收敛到已有环境
 	Rationale string // 判定依据（新建/复用/并发收敛）
 }
+
+// RenewResult 是租约续期结果。
+type RenewResult struct {
+	Env        *Environment
+	OldExpires time.Time // 续期前该占用者自己的租约到期时间
+	NewExpires time.Time // 续期后该占用者自己的租约到期时间
+	Rationale  string    // 判定依据
+}
+
+// ReclaimSkipped 记录一次回收扫描中被跳过的环境及原因。
+type ReclaimSkipped struct {
+	Name   string
+	Reason string
+}
+
+// ReclaimFailure 记录一次回收扫描中回收失败的环境及原因（可安全重试）。
+type ReclaimFailure struct {
+	Name string
+	Err  string
+}
+
+// ReclaimReport 是一次空闲回收扫描的完整结论。
+// 回收失败体现在 Failures 中而不是静默丢弃，调用方可据此安全重试。
+type ReclaimReport struct {
+	Reclaimed []string         // 本次成功回收的环境
+	Skipped   []ReclaimSkipped // 被跳过的环境（仍在使用/空闲不足阈值等）及依据
+	Failures  []ReclaimFailure // 回收失败的环境（状态已回滚，可重试）
+}
+
+// Succeeded 报告本次扫描是否全部处理成功（没有回收失败）。
+func (r *ReclaimReport) Succeeded() bool { return len(r.Failures) == 0 }
+
+// HasFailures 报告本次扫描是否存在回收失败。
+func (r *ReclaimReport) HasFailures() bool { return len(r.Failures) > 0 }

@@ -16,13 +16,21 @@ type fakeBackend struct {
 	stops     int
 	stopErr   error
 	stopCalls int
+	running   map[int]bool // 按 PID 追踪仍在运行的实例，验证停机无进程泄漏
 }
+
+var errFoo = errors.New("模拟后端故障")
 
 func (f *fakeBackend) Start(env *Environment) (*Handle, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.starts++
-	return &Handle{PID: 1000 + f.starts}, nil
+	pid := 1000 + f.starts
+	if f.running == nil {
+		f.running = map[int]bool{}
+	}
+	f.running[pid] = true
+	return &Handle{PID: pid}, nil
 }
 
 func (f *fakeBackend) Stop(h *Handle) error {
@@ -33,11 +41,15 @@ func (f *fakeBackend) Stop(h *Handle) error {
 		return f.stopErr
 	}
 	f.stops++
+	if f.running != nil {
+		delete(f.running, h.PID)
+	}
 	return nil
 }
 
 func (f *fakeBackend) setStopErr(err error) { f.mu.Lock(); f.stopErr = err; f.mu.Unlock() }
 func (f *fakeBackend) startCount() int      { f.mu.Lock(); defer f.mu.Unlock(); return f.starts }
+func (f *fakeBackend) runningCount() int    { f.mu.Lock(); defer f.mu.Unlock(); return len(f.running) }
 
 func newTestController(t *testing.T, cfg Config) (*Controller, *fakeBackend) {
 	t.Helper()

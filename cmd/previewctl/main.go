@@ -82,6 +82,32 @@ func main() {
 	fmt.Println("== 7. 回收后重新申请 demo-a（应为新建） ==")
 	r := mustAcquire(c, "cli-4", "demo-a", "user-9")
 	fmt.Printf("  状态变化: 回收后重新申请 -> created=%v state=%s port=%d\n", r.Created, r.Env.State, r.Env.Port)
+
+	fmt.Println("== 8. 退出前尽力清理全部实例（避免演示遗留后台进程） ==")
+	cleanupDemo(c)
+}
+
+// cleanupDemo 释放演示中申请过的全部占用并销毁/回收所有环境，做到无残留。
+func cleanupDemo(c *preview.Controller) {
+	names := []string{"demo-a"}
+	for i := 0; i < 10; i++ {
+		names = append(names, fmt.Sprintf("fill-%d", i))
+	}
+	for _, name := range names {
+		for _, h := range []string{"user-1", "user-2", "user-3", "user-4", "user-5", "user-9", "filler"} {
+			if err := c.Release("cli-cleanup", name, h); err != nil {
+				var pe *preview.Error
+				// 不存在、未占用、已回收都视为已清理，继续下一个。
+				if errors.As(err, &pe) &&
+					(pe.Code == preview.ErrNotFound || pe.Code == preview.ErrNotHeld || pe.Code == preview.ErrEnvInUse) {
+					continue
+				}
+			}
+		}
+		_ = c.Destroy("cli-cleanup", name) // 空闲则立即销毁；仍被占用则忽略
+	}
+	reclaimed, err := c.Reclaim("cli-cleanup-final")
+	fmt.Printf("  最终回收: %v err=%v（无残留后台进程）\n", reclaimed, err)
 }
 
 func mustAcquire(c *preview.Controller, reqID, name, holder string) *preview.AcquireResult {

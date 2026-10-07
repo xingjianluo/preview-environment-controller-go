@@ -46,18 +46,21 @@ func (b *ProcessBackend) Start(env *Environment) (*Handle, error) {
 
 // Stop 停止本地进程。幂等：已停止的句柄直接返回 nil；
 // 进程已退出（ESRCH / Wait 返回退出错误）也视为停止成功。
+// 仅在确认信号已发出或进程已不存在时才置 stopped，保证信号发送失败可安全重试。
 func (b *ProcessBackend) Stop(h *Handle) error {
 	if h == nil || h.stopped {
 		return nil
 	}
-	h.stopped = true
 	if err := h.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		if errors.Is(err, syscall.ESRCH) {
+			h.stopped = true
 			_ = h.cmd.Wait()
 			return nil
 		}
+		// 不置 stopped：调用方可安全重试 Stop。
 		return fmt.Errorf("停止进程 %d 失败: %w", h.PID, err)
 	}
+	h.stopped = true
 	// Wait 收割子进程；进程被信号杀死会返回退出错误，属预期。
 	_ = h.cmd.Wait()
 	return nil
