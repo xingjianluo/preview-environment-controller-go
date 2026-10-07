@@ -47,7 +47,7 @@ func newTestController(t *testing.T, cfg Config) (*Controller, *fakeBackend) {
 }
 
 func testCfg() Config {
-	return Config{MaxEnvs: 4, PortBase: 18000, PortEnd: 18003, TTL: time.Minute}
+	return Config{MaxEnvs: 4, PortBase: 18000, PortEnd: 18003, TTL: time.Minute, IdleTTL: 30 * time.Second}
 }
 
 func mustCode(t *testing.T, err error, want ErrCode) {
@@ -180,13 +180,14 @@ func TestReclaimExpired(t *testing.T) {
 	}
 
 	now = base.Add(2 * time.Minute) // 全部过期
-	reclaimed, err := c.Reclaim("rc-4")
+	report, err := c.Reclaim("rc-4")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(reclaimed) != 1 || reclaimed[0] != "idle-env" {
-		t.Fatalf("回收列表=%v，期望仅 [idle-env]", reclaimed)
+	if len(report.Reclaimed) != 1 || report.Reclaimed[0] != "idle-env" {
+		t.Fatalf("回收列表=%v，期望仅 [idle-env]", report.Reclaimed)
 	}
+	busyItem := report.Skipped[0]
 	idle, _ := c.Get("idle-env")
 	busy, _ := c.Get("busy-env")
 	if idle.State != StateReclaimed {
@@ -195,7 +196,10 @@ func TestReclaimExpired(t *testing.T) {
 	if busy.State != StateReady || !busy.InUse() {
 		t.Fatalf("busy-env 不应被回收: state=%s holders=%v", busy.State, busy.Holders)
 	}
-	t.Logf("判定依据: idle-env 已过期且空闲被回收；busy-env 已过期但使用中被跳过")
+	if busyItem.Name != "busy-env" || busyItem.Why != WhyBusy {
+		t.Fatalf("busy-env 跳过依据=%+v，期望 why=%s", busyItem, WhyBusy)
+	}
+	t.Logf("判定依据: idle-env 已过期且空闲被回收；busy-env 已过期但使用中被跳过(why=%s)", busyItem.Why)
 
 	// 回收后再申请：得到新实例，端口被复用
 	r, err := c.Acquire("rc-5", "idle-env", "h3")
@@ -223,12 +227,15 @@ func TestReclaimRetryAndIdempotent(t *testing.T) {
 	now = base.Add(2 * time.Minute)
 
 	fb.setStopErr(errors.New("模拟后端故障"))
-	reclaimed, err := c.Reclaim("rt-3")
+	report, err := c.Reclaim("rt-3")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(reclaimed) != 0 {
-		t.Fatalf("故障时不应回收成功: %v", reclaimed)
+	if len(report.Reclaimed) != 0 {
+		t.Fatalf("故障时不应回收成功: %v", report.Reclaimed)
+	}
+	if len(report.Failures) != 1 {
+		t.Fatalf("回收失败应在 Failures 对外可见，实际 %+v", report.Failures)
 	}
 	env, _ := c.Get("env-x")
 	if env.State != StateReady {
@@ -240,9 +247,9 @@ func TestReclaimRetryAndIdempotent(t *testing.T) {
 	t.Logf("判定依据: 回收失败回滚 state=Ready，ReclaimErr=%q", env.ReclaimErr)
 
 	fb.setStopErr(nil)
-	reclaimed, err = c.Reclaim("rt-4")
-	if err != nil || len(reclaimed) != 1 {
-		t.Fatalf("重试回收应成功: reclaimed=%v err=%v", reclaimed, err)
+	report, err = c.Reclaim("rt-4")
+	if err != nil || len(report.Reclaimed) != 1 {
+		t.Fatalf("重试回收应成功: reclaimed=%v err=%v", report.Reclaimed, err)
 	}
 	env, _ = c.Get("env-x")
 	if env.State != StateReclaimed || env.ReclaimErr != "" {
@@ -250,9 +257,9 @@ func TestReclaimRetryAndIdempotent(t *testing.T) {
 	}
 
 	// 幂等：再次回收是空操作
-	reclaimed, err = c.Reclaim("rt-5")
-	if err != nil || len(reclaimed) != 0 {
-		t.Fatalf("重复回收应为幂等空操作: reclaimed=%v err=%v", reclaimed, err)
+	report, err = c.Reclaim("rt-5")
+	if err != nil || len(report.Reclaimed) != 0 || len(report.Failures) != 0 {
+		t.Fatalf("重复回收应为幂等空操作: report=%+v err=%v", report, err)
 	}
 	t.Log("判定依据: 重复 Reclaim 对已回收环境为空操作")
 }

@@ -1,35 +1,103 @@
-// previewctl 是本地验证入口：用本地进程模拟环境实例，
-// 演示申请、并发收敛、释放、过期回收与失败重试的完整生命周期。
+// previewctl 提供两种本地入口：
+//
+//	previewctl demo（默认）  用本地进程模拟环境实例，演示申请、并发收敛、
+//	                         释放、空闲回收与失败重试的完整生命周期；
+//	previewctl serve         启动常驻 HTTP 服务，对外提供申请/释放/回收/
+//	                         查询/续期入口，并在收到中断信号时优雅停机收尾。
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/xingjianluo/preview-environment-controller-go/internal/preview"
+	"github.com/xingjianluo/preview-environment-controller-go/internal/service"
 )
 
 func main() {
-	var (
-		maxEnvs  = flag.Int("max-envs", 3, "配额：最大并存环境数")
-		portBase = flag.Int("port-base", 18000, "端口池起始")
-		portEnd  = flag.Int("port-end", 18002, "端口池结束")
-		ttl      = flag.Duration("ttl", 30*time.Second, "环境过期时长")
-	)
-	flag.Parse()
+	if len(os.Args) > 1 && os.Args[1] == "serve" {
+		runServe(os.Args[2:])
+		return
+	}
+	runDemo(os.Args[1:])
+}
+
+func commonFlags(fs *flag.FlagSet) (*int, *int, *int, *time.Duration, *time.Duration) {
+	maxEnvs := fs.Int("max-envs", 3, "配额：最大并存环境数")
+	portBase := fs.Int("port-base", 18000, "端口池起始")
+	portEnd := fs.Int("port-end", 18002, "端口池结束")
+	ttl := fs.Duration("ttl", 30*time.Second, "每个占用者的默认租约时长")
+	idleTTL := fs.Duration("idle-ttl", 2*time.Second, "最后占用者离开后多久可被空闲回收")
+	return maxEnvs, portBase, portEnd, ttl, idleTTL
+}
+
+func newController(maxEnvs, portBase, portEnd int, ttl, idleTTL time.Duration, logger *log.Logger) *preview.Controller {
+	return preview.New(preview.Config{
+		MaxEnvs:  maxEnvs,
+		PortBase: portBase,
+		PortEnd:  portEnd,
+		TTL:      ttl,
+		IdleTTL:  idleTTL,
+	}, preview.NewProcessBackend(), logger)
+}
+
+func runServe(args []string) {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	addr := fs.String("addr", "127.0.0.1:18080", "HTTP 监听地址")
+	grace := fs.Duration("grace", 30*time.Second, "停机时等待在用环境释放的宽限期，超时强制停止")
+	maxEnvs, portBase, portEnd, ttl, idleTTL := commonFlags(fs)
+	_ = fs.Parse(args)
+
+	logger := log.New(os.Stdout, "[previewctl-serve] ", log.LstdFlags|log.Lmicroseconds)
+	ctrl := newController(*maxEnvs, *portBase, *portEnd, *ttl, *idleTTL, logger)
+	srv := service.NewServer(ctrl, *addr, *grace, logger)
+	if err := srv.Start(); err != nil {
+		fmt.Println("启动服务失败:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("常驻服务已启动: http://%s （Ctrl-C 触发优雅停机）\n", srv.Addr())
+
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-sigCh
+	logger.Printf("[req=signal] 收到信号 %s，开始优雅停机（重复信号也安全）", sig)
+
+	ctx, cancel := context.WithTimeout(context.Background(), *grace+10*time.Second)
+	defer cancel()
+
+	// 停机过程中再次收到信号：重复触发 Shutdown，幂等返回同一结论，不出错。
+	go func() {
+		for s := range sigCh {
+			logger.Printf("[req=signal] 再次收到信号 %s：重复触发停机（幂等）", s)
+			if r, e := srv.Shutdown(ctx); e != nil {
+				logger.Printf("[req=signal] 重复停机结论: stopped=%v err=%v", r, e)
+			}
+		}
+	}()
+
+	rep, err := srv.Shutdown(ctx)
+	if err != nil {
+		fmt.Printf("停机收尾未完全成功: %v；残留失败: %+v\n", err, rep.Failures)
+		os.Exit(1)
+	}
+	fmt.Printf("已优雅停机，共停止实例 %v，无后台残留进程\n", rep.Stopped)
+}
+
+func runDemo(args []string) {
+	fs := flag.NewFlagSet("demo", flag.ExitOnError)
+	maxEnvs, portBase, portEnd, ttl, idleTTL := commonFlags(fs)
+	_ = fs.Parse(args)
 
 	logger := log.New(os.Stdout, "[previewctl] ", log.Lmicroseconds)
-	c := preview.New(preview.Config{
-		MaxEnvs:  *maxEnvs,
-		PortBase: *portBase,
-		PortEnd:  *portEnd,
-		TTL:      *ttl,
-	}, preview.NewProcessBackend(), logger)
+	c := newController(*maxEnvs, *portBase, *portEnd, *ttl, *idleTTL, logger)
 
 	fmt.Println("== 1. 申请环境 demo-a（新建） ==")
 	mustAcquire(c, "cli-1", "demo-a", "user-1")
@@ -50,10 +118,18 @@ func main() {
 	}
 	wg.Wait()
 
-	fmt.Println("== 3. 销毁使用中的环境（应被拒绝 ENV_IN_USE） ==")
+	fmt.Println("== 3. 续期：user-1 给自己续 10s（不影响其他占用者） ==")
+	if env, err := c.Renew("cli-renew", "demo-a", "user-1", 10*time.Second); err != nil {
+		printErr(err)
+	} else {
+		fmt.Printf("  续期成功: envExpiresAt=%s holders=%v\n",
+			env.ExpiresAt.Format(time.RFC3339), env.Holders)
+	}
+
+	fmt.Println("== 4. 销毁使用中的环境（应被拒绝 ENV_IN_USE） ==")
 	printErr(c.Destroy("cli-2", "demo-a"))
 
-	fmt.Println("== 4. 配额/端口边界：继续申请直到被拒 ==")
+	fmt.Println("== 5. 配额/端口边界：继续申请直到被拒 ==")
 	for i := 0; ; i++ {
 		_, err := c.Acquire(fmt.Sprintf("cli-fill-%d", i), fmt.Sprintf("fill-%d", i), "filler")
 		if err != nil {
@@ -62,7 +138,7 @@ func main() {
 		}
 	}
 
-	fmt.Println("== 5. 释放全部占用者后销毁 demo-a ==")
+	fmt.Println("== 6. 释放全部占用者（开始计空闲） ==")
 	for _, h := range []string{"user-1", "user-2", "user-3", "user-4", "user-5"} {
 		if err := c.Release("cli-rel", "demo-a", h); err != nil {
 			var pe *preview.Error
@@ -72,14 +148,14 @@ func main() {
 			printErr(err)
 		}
 	}
-	printErr(c.Destroy("cli-3", "demo-a"))
 
-	fmt.Println("== 6. 等待 TTL 过期后回收空闲环境 ==")
-	time.Sleep(*ttl + 100*time.Millisecond)
-	reclaimed, err := c.Reclaim("cli-reclaim")
-	fmt.Printf("  回收结果: %v err=%v\n", reclaimed, err)
+	fmt.Printf("== 7. 等待空闲阈值 %s 后按空闲回收 ==\n", *idleTTL)
+	time.Sleep(*idleTTL + 200*time.Millisecond)
+	rep, err := c.Reclaim("cli-reclaim")
+	fmt.Printf("  回收结果: reclaimed=%v failures=%d skipped=%d err=%v\n",
+		rep.Reclaimed, len(rep.Failures), len(rep.Skipped), err)
 
-	fmt.Println("== 7. 回收后重新申请 demo-a（应为新建） ==")
+	fmt.Println("== 8. 回收后重新申请 demo-a（应为新建） ==")
 	r := mustAcquire(c, "cli-4", "demo-a", "user-9")
 	fmt.Printf("  状态变化: 回收后重新申请 -> created=%v state=%s port=%d\n", r.Created, r.Env.State, r.Env.Port)
 }

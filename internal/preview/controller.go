@@ -2,6 +2,7 @@ package preview
 
 import (
 	"log"
+	"sort"
 	"sync"
 	"time"
 )
@@ -11,7 +12,8 @@ type Config struct {
 	MaxEnvs  int           // 配额：最大并存（未回收）环境数
 	PortBase int           // 端口池起始（含）
 	PortEnd  int           // 端口池结束（含）
-	TTL      time.Duration // 环境自创建起的过期时长
+	TTL      time.Duration // 每个占用者租约的默认时长，也是环境整体到期口径
+	IdleTTL  time.Duration // 最后一个占用者离开后，空闲多久才允许回收
 }
 
 // Controller 编排预览环境的申请、释放与回收。
@@ -66,12 +68,18 @@ func (c *Controller) Acquire(requestID, name, holder string) (*AcquireResult, er
 				name, holder, ErrNameConflict)
 			return nil, newError(ErrNameConflict, "环境 %q 正在回收中，禁止同名申请", name)
 		}
+		now := c.now()
 		if !env.HasHolder(holder) {
 			env.Holders = append(env.Holders, holder)
+			// 新加入的占用者获得一份独立租约；环境整体到期时间取所有租约最大值。
+			env.LeaseExpiry[holder] = now.Add(c.cfg.TTL)
+			c.recomputeExpiryLocked(env)
+			env.IdleAt = time.Time{} // 重新进入使用状态，清除空闲起点
 		}
 		rationale := "复用已有环境（同名申请收敛，未重复创建）"
-		c.logf(requestID, "acquire name=%s holder=%s -> 复用 state=%s port=%d holders=%v 依据: %s",
-			name, holder, env.State, env.Port, env.Holders, rationale)
+		c.logf(requestID, "acquire name=%s holder=%s -> 复用 state=%s port=%d holders=%v leaseExpiry=%s 依据: %s",
+			name, holder, env.State, env.Port, env.Holders,
+			env.LeaseExpiry[holder].Format(time.RFC3339), rationale)
 		return &AcquireResult{Env: cloneEnv(env), Created: false, Rationale: rationale}, nil
 	}
 
@@ -89,15 +97,18 @@ func (c *Controller) Acquire(requestID, name, holder string) (*AcquireResult, er
 	}
 
 	now := c.now()
+	leaseDeadline := now.Add(c.cfg.TTL)
 	env := &Environment{
-		Name:      name,
-		Port:      port,
-		State:     StateProvisioning,
-		Holders:   []string{holder},
-		CreatedAt: now,
-		ExpiresAt: now.Add(c.cfg.TTL),
+		Name:        name,
+		Port:        port,
+		State:       StateProvisioning,
+		Holders:     []string{holder},
+		CreatedAt:   now,
+		ExpiresAt:   leaseDeadline,
+		LeaseExpiry: map[string]time.Time{holder: leaseDeadline},
 	}
-	c.logf(requestID, "acquire name=%s holder=%s -> 新建 state=%s port=%d", name, holder, env.State, port)
+	c.logf(requestID, "acquire name=%s holder=%s -> 新建 state=%s port=%d leaseExpiry=%s",
+		name, holder, env.State, port, leaseDeadline.Format(time.RFC3339))
 
 	h, err := c.backend.Start(env)
 	if err != nil {
@@ -137,8 +148,35 @@ func (c *Controller) Release(requestID, name, holder string) error {
 		}
 	}
 	env.Holders = next
-	c.logf(requestID, "release name=%s holder=%s -> 成功 state=%s 剩余占用=%v", name, holder, env.State, env.Holders)
+	delete(env.LeaseExpiry, holder) // 离开后其个人租约不再影响环境到期口径
+	c.recomputeExpiryLocked(env)
+	now := c.now()
+	if !env.InUse() {
+		// 最后一个占用者离开：从这一刻开始计空闲时间。
+		if env.IdleAt.IsZero() {
+			env.IdleAt = now
+		}
+		c.logf(requestID, "release name=%s holder=%s -> 成功 state=%s 剩余占用=[] idleAt=%s 依据: 最后占用者离开，开始计空闲",
+			name, holder, env.State, env.IdleAt.Format(time.RFC3339))
+	} else {
+		c.logf(requestID, "release name=%s holder=%s -> 成功 state=%s 剩余占用=%v", name, holder, env.State, env.Holders)
+	}
 	return nil
+}
+
+// recomputeExpiryLocked 按各占用者个人租约的最大值重算环境整体到期时间。
+// 没有占用者时保持原 ExpiresAt 不动（空闲回收不再以 ExpiresAt 为准，
+// 而是以 IdleAt + IdleTTL 为准）。
+func (c *Controller) recomputeExpiryLocked(env *Environment) {
+	var max time.Time
+	for _, t := range env.LeaseExpiry {
+		if max.IsZero() || t.After(max) {
+			max = t
+		}
+	}
+	if !max.IsZero() {
+		env.ExpiresAt = max
+	}
 }
 
 // Destroy 强制销毁空闲环境。正在使用中的环境拒绝销毁（ErrEnvInUse）。
@@ -161,33 +199,51 @@ func (c *Controller) Destroy(requestID, name string) error {
 	return nil
 }
 
-// Reclaim 回收所有已过期且空闲的环境；仍在使用的过期环境跳过。
-// 回收失败会记录在环境的 ReclaimErr 上并保持原状态，可安全重试；
-// 对已回收环境重复回收是幂等空操作。
-func (c *Controller) Reclaim(requestID string) ([]string, error) {
+// Reclaim 按空闲时间回收环境：环境在最后一个占用者离开（IdleAt）之后，
+// 空闲时长超过 IdleTTL 才允许回收。仍在使用的环境一律跳过——即使它已经
+// 超过整体到期时间，也照常可用。回收失败记录在环境的 ReclaimErr 上并在
+// 报告 Failures 中对外可见、可安全重试；对已回收环境重复回收是幂等空操作。
+func (c *Controller) Reclaim(requestID string) (*ReclaimReport, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	now := c.now()
-	var reclaimed []string
+	report := &ReclaimReport{}
 	for _, env := range c.envs {
 		if env.State == StateReclaimed {
 			continue // 幂等：已回收的直接跳过
 		}
-		if !env.Expired(now) {
-			continue
+		item := ReclaimItem{Name: env.Name}
+		switch {
+		case env.InUse():
+			// 还在被使用：哪怕已超过整体到期时间也绝不回收，照常可用。
+			item.Why = WhyBusy
+			c.logf(requestID, "reclaim name=%s -> 跳过 依据: 仍在使用 holders=%v expired=%v",
+				env.Name, env.Holders, env.Expired(now))
+			report.Skipped = append(report.Skipped, item)
+		case env.IdleAt.IsZero():
+			// 防御口径：无占用者但缺空闲起点，视为空闲时长不足。
+			item.Why = WhyIdleNotEnough
+			c.logf(requestID, "reclaim name=%s -> 跳过 依据: 空闲起点未知", env.Name)
+			report.Skipped = append(report.Skipped, item)
+		case now.Before(env.IdleAt.Add(c.cfg.IdleTTL)):
+			item.Why = WhyIdleNotEnough
+			c.logf(requestID, "reclaim name=%s -> 跳过 依据: 空闲未满阈值 idleAt=%s idleTTL=%s",
+				env.Name, env.IdleAt.Format(time.RFC3339), c.cfg.IdleTTL)
+			report.Skipped = append(report.Skipped, item)
+		default:
+			if err := c.reclaimLocked(requestID, env, "idle-expired"); err != nil {
+				c.logf(requestID, "reclaim name=%s -> 失败(可重试) err=%v", env.Name, err)
+				item.Failed = true
+				item.Err = err.Error()
+				item.Why = WhyIdleExpired
+				report.Failures = append(report.Failures, item)
+				continue
+			}
+			report.Reclaimed = append(report.Reclaimed, env.Name)
 		}
-		if env.InUse() {
-			c.logf(requestID, "reclaim name=%s -> 跳过 依据: 已过期但仍在使用 holders=%v", env.Name, env.Holders)
-			continue
-		}
-		if err := c.reclaimLocked(requestID, env, "ttl-expired"); err != nil {
-			c.logf(requestID, "reclaim name=%s -> 失败(可重试) err=%v", env.Name, err)
-			continue
-		}
-		reclaimed = append(reclaimed, env.Name)
 	}
-	return reclaimed, nil
+	return report, nil
 }
 
 // reclaimLocked 执行状态迁移 Ready->Reclaiming->Reclaimed 并释放端口。
@@ -224,6 +280,22 @@ func (c *Controller) Get(name string) (*Environment, bool) {
 	return cloneEnv(env), true
 }
 
+// List 返回全部环境的快照（按名称排序），供服务入口查询。
+func (c *Controller) List() []*Environment {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	names := make([]string, 0, len(c.envs))
+	for name := range c.envs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]*Environment, 0, len(names))
+	for _, name := range names {
+		out = append(out, cloneEnv(c.envs[name]))
+	}
+	return out
+}
+
 // activeCountLocked 统计未回收的环境数（配额口径）。
 func (c *Controller) activeCountLocked() int {
 	n := 0
@@ -249,6 +321,12 @@ func (c *Controller) allocPortLocked() (int, bool) {
 func cloneEnv(e *Environment) *Environment {
 	cp := *e
 	cp.Holders = append([]string(nil), e.Holders...)
+	if e.LeaseExpiry != nil {
+		cp.LeaseExpiry = make(map[string]time.Time, len(e.LeaseExpiry))
+		for k, v := range e.LeaseExpiry {
+			cp.LeaseExpiry[k] = v
+		}
+	}
 	cp.handle = nil
 	return &cp
 }
